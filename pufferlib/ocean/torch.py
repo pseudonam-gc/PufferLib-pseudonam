@@ -902,7 +902,6 @@ class Drone(nn.Module):
         values = self.value(hidden)
         return logits, values
 
-
 class G2048(nn.Module):
     def __init__(self, env, hidden_size=128):
         super().__init__()
@@ -958,6 +957,95 @@ class G2048(nn.Module):
         observations[:, :16] = observations[:, :16] / 100.0
 
         return self.encoder(observations)
+
+    def decode_actions(self, hidden):
+        logits = self.decoder(hidden)
+        values = self.value(hidden)
+        return logits, values
+
+import math
+class Threes(nn.Module):
+    def __init__(self, env, hidden_size=128, embed_dim=5, one_hot=False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.one_hot = one_hot
+
+        if one_hot:
+            self.dim = 18  # one-hot size for tile values 0-17
+        else:
+            self.dim = embed_dim
+            self.value_embed = torch.nn.Embedding(18, self.dim)
+
+        self.num_tiles = 17  # 16 grid + 1 next tile
+        self.num_obs = self.num_tiles * self.dim
+        self.pos_embed = torch.nn.Embedding(self.num_tiles, self.dim)
+
+        # Extra features: bag(4)
+        self.extra_dim = 4
+        self.extra_hidden = 32
+
+        self.extra_encoder = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(self.extra_dim, self.extra_hidden)),
+            nn.GELU(),
+        )
+
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Flatten(),
+            pufferlib.pytorch.layer_init(nn.Linear(self.num_obs + self.extra_hidden, 2 * hidden_size)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2 * hidden_size, hidden_size)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
+        )
+
+        num_atns = env.single_action_space.n
+        self.decoder = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, num_atns), std=0.01),
+        )
+        self.value = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(hidden_size, 1), std=1.0),
+        )
+
+    def forward_eval(self, observations, state=None):
+        hidden = self.encode_observations(observations, state=state)
+        logits, values = self.decode_actions(hidden)
+        return logits, values
+
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        grid_obs = observations[:, :17] # 16 grid tiles + next tile one-hot
+        bag_obs = observations[:, 17:21].float() # bag counts 
+
+        # Encode grid with embeddings or one-hot
+        if self.one_hot:
+            value_obs = F.one_hot(grid_obs.long(), 18).float() # [B, 17, 18]
+        else:
+            value_obs = self.value_embed(grid_obs.long())
+
+        #pos_obs = self.pos_embed.weight.expand(*value_obs.shape)
+        positions = torch.arange(17, device=observations.device)
+        tile_pos = self.pos_embed(positions)  # [17, dim]
+        
+        tile_encoded = (value_obs + tile_pos).flatten(start_dim=1) # [B, 17*18]
+        
+        #grid_encoded = (value_obs + pos_obs).flatten(start_dim=1)                                     
+        #grid_encoded = self.value_embed(grid_obs.long()) 
+        #next_encoded = self.value_embed(next_obs.long())
+                                                                                                    
+        # Encode extra features                                                                       
+        bag_encoded = self.extra_encoder(bag_obs)                                                 
+                                                                                                    
+        # Concatenate and pass through main encoder                                                   
+        combined = torch.cat([tile_encoded, bag_encoded], dim=1)         
+        return self.encoder(combined)  
 
     def decode_actions(self, hidden):
         logits = self.decoder(hidden)

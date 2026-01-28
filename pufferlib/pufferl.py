@@ -182,11 +182,21 @@ class PuffeRL:
         if logger is None:
             self.logger = NoLogger(config)
 
-        # Learning rate scheduler
+        # Learning rate scheduler with optional warmup
         epochs = config['total_timesteps'] // config['batch_size']
         eta_min = config['learning_rate'] * config['min_lr_ratio']
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs, eta_min=eta_min)
+        warmup_epochs = config.get('warmup_epochs', 0)
+
+        if warmup_epochs > 0:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_epochs)
+            main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=epochs - warmup_epochs, eta_min=eta_min)
+            self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
+        else:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=epochs, eta_min=eta_min)
         self.total_epochs = epochs
 
         # Automatic mixed precision
@@ -922,7 +932,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
         os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
 
     vecenv = vecenv or load_env(env_name, args)
-    policy = policy or load_policy(args, vecenv, env_name)
+    trainer_state = None
+    if policy is None:
+        policy, trainer_state = load_policy(args, vecenv, env_name)
 
     if 'LOCAL_RANK' in os.environ:
         args['train']['device'] = torch.cuda.current_device()
@@ -945,6 +957,27 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
 
     train_config = { **args['train'], 'env': env_name }
     pufferl = PuffeRL(train_config, vecenv, policy, logger)
+
+    # Load optimizer state from checkpoint if available (momentum, Adam buffers, etc.)
+    if trainer_state is not None:
+        pufferl.optimizer.load_state_dict(trainer_state['optimizer_state_dict'])
+        # Reset LR and recreate scheduler (load_state_dict corrupts scheduler state)
+        for param_group in pufferl.optimizer.param_groups:
+            param_group['lr'] = train_config['learning_rate']
+            param_group['initial_lr'] = train_config['learning_rate']
+        # Recreate scheduler fresh
+        warmup_epochs = train_config.get('warmup_epochs', 0)
+        eta_min = train_config['learning_rate'] * train_config['min_lr_ratio']
+        if warmup_epochs > 0:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                pufferl.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_epochs)
+            main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                pufferl.optimizer, T_max=pufferl.total_epochs - warmup_epochs, eta_min=eta_min)
+            pufferl.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                pufferl.optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
+        else:
+            pufferl.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                pufferl.optimizer, T_max=pufferl.total_epochs, eta_min=eta_min)
 
     # Sweep needs data for early stopped runs, so send data when steps > 100M
     logging_threshold = min(0.20*train_config['total_timesteps'], 100_000_000)
@@ -1000,7 +1033,8 @@ def eval(env_name, args=None, vecenv=None, policy=None):
     args['vec'] = dict(backend=backend, num_envs=1)
     vecenv = vecenv or load_env(env_name, args)
 
-    policy = policy or load_policy(args, vecenv, env_name)
+    if policy is None:
+        policy, _ = load_policy(args, vecenv, env_name)
     ob, info = vecenv.reset()
     driver = vecenv.driver_env
     num_agents = vecenv.observation_space.shape[0]
@@ -1129,7 +1163,8 @@ def sweep(args=None, env_name=None):
 def profile(args=None, env_name=None, vecenv=None, policy=None):
     args = load_config()
     vecenv = vecenv or load_env(env_name, args)
-    policy = policy or load_policy(args, vecenv)
+    if policy is None:
+        policy, _ = load_policy(args, vecenv)
 
     train_config = dict(**args['train'], env=args['env_name'], tag=args['tag'])
     pufferl = PuffeRL(train_config, vecenv, policy, neptune=args['neptune'], wandb=args['wandb'])
@@ -1149,7 +1184,8 @@ def export(args=None, env_name=None, vecenv=None, policy=None):
     args = args or load_config(env_name)
     args['vec'] = dict(backend='Serial', num_envs=1)
     vecenv = vecenv or load_env(env_name, args)
-    policy = policy or load_policy(args, vecenv)
+    if policy is None:
+        policy, _ = load_policy(args, vecenv)
 
     weights = []
     for name, param in policy.named_parameters():
@@ -1209,15 +1245,17 @@ def load_policy(args, vecenv, env_name=''):
     if load_path == 'latest':
         load_path = max(glob.glob(f"experiments/{env_name}*.pt"), key=os.path.getctime)
 
+    trainer_state = None
     if load_path is not None:
         state_dict = torch.load(load_path, map_location=device)
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         policy.load_state_dict(state_dict)
-        #state_path = os.path.join(*load_path.split('/')[:-1], 'state.pt')
-        #optim_state = torch.load(state_path)['optimizer_state_dict']
-        #pufferl.optimizer.load_state_dict(optim_state)
+        # Load trainer state (optimizer, global_step, epoch) if available
+        trainer_state_path = load_path.replace('.pt', '') + '/trainer_state.pt'
+        if os.path.exists(trainer_state_path):
+            trainer_state = torch.load(trainer_state_path, map_location=device, weights_only=False)
 
-    return policy
+    return policy, trainer_state
 
 def load_config(env_name, parser=None):
     puffer_dir = os.path.dirname(os.path.realpath(__file__))

@@ -36,10 +36,11 @@ struct Weights {
     int idx;
 };
 
-void _load_weights(const char* filename, float* weights, size_t num_weights) {
+int _load_weights(const char* filename, float* weights, size_t num_weights) {
     FILE* file = fopen(filename, "rb");
     if (!file) {
         perror("Error opening file");
+        return -1;
     }
     fseek(file, 0, SEEK_END);
     rewind(file);
@@ -47,13 +48,18 @@ void _load_weights(const char* filename, float* weights, size_t num_weights) {
     fclose(file);
     if (read_size != num_weights) {
         perror("Error reading file");
+        return -1;
     }
+    return 0;
 }
 
 Weights* load_weights(const char* filename, size_t num_weights) {
     Weights* weights = calloc(1, sizeof(Weights) + num_weights*sizeof(float));
     weights->data = (float*)(weights + 1);
-    _load_weights(filename, weights->data, num_weights);
+    if (_load_weights(filename, weights->data, num_weights) != 0) {
+        free(weights);
+        return NULL;
+    }
     weights->size = num_weights;
     weights->idx = 0;
     return weights;
