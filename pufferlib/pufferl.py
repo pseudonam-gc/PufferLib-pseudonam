@@ -186,6 +186,7 @@ class PuffeRL:
         epochs = config['total_timesteps'] // config['batch_size']
         eta_min = config['learning_rate'] * config['min_lr_ratio']
         warmup_epochs = config.get('warmup_epochs', 0)
+        lr_cycle_epochs = config.get('lr_cycle_epochs', 0)
 
         if warmup_epochs > 0:
             warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -194,6 +195,9 @@ class PuffeRL:
                 optimizer, T_max=epochs - warmup_epochs, eta_min=eta_min)
             self.scheduler = torch.optim.lr_scheduler.SequentialLR(
                 optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
+        elif lr_cycle_epochs > 0:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=lr_cycle_epochs, T_mult=1, eta_min=eta_min)
         else:
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=epochs, eta_min=eta_min)
@@ -967,6 +971,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
             param_group['initial_lr'] = train_config['learning_rate']
         # Recreate scheduler fresh
         warmup_epochs = train_config.get('warmup_epochs', 0)
+        lr_cycle_epochs = train_config.get('lr_cycle_epochs', 0)
         eta_min = train_config['learning_rate'] * train_config['min_lr_ratio']
         if warmup_epochs > 0:
             warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -975,6 +980,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
                 pufferl.optimizer, T_max=pufferl.total_epochs - warmup_epochs, eta_min=eta_min)
             pufferl.scheduler = torch.optim.lr_scheduler.SequentialLR(
                 pufferl.optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
+        elif lr_cycle_epochs > 0:
+            pufferl.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                pufferl.optimizer, T_0=lr_cycle_epochs, T_mult=1, eta_min=eta_min)
         else:
             pufferl.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 pufferl.optimizer, T_max=pufferl.total_epochs, eta_min=eta_min)

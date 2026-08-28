@@ -1030,16 +1030,11 @@ class Threes(nn.Module):
         else:
             value_obs = self.value_embed(grid_obs.long())
 
-        #pos_obs = self.pos_embed.weight.expand(*value_obs.shape)
         positions = torch.arange(17, device=observations.device)
         tile_pos = self.pos_embed(positions)  # [17, dim]
         
         tile_encoded = (value_obs + tile_pos).flatten(start_dim=1) # [B, 17*18]
-        
-        #grid_encoded = (value_obs + pos_obs).flatten(start_dim=1)                                     
-        #grid_encoded = self.value_embed(grid_obs.long()) 
-        #next_encoded = self.value_embed(next_obs.long())
-                                                                                                    
+                                           
         # Encode extra features                                                                       
         bag_encoded = self.extra_encoder(bag_obs)                                                 
                                                                                                     

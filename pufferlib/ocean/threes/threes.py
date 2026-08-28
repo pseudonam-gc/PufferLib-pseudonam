@@ -75,6 +75,48 @@ class Threes(pufferlib.PufferEnv):
     def close(self):
         binding.vec_close(self.c_envs)
 
+def test_env_speeds():
+    import torch
+    # which num_env / cache counts would be best for benchmarking? 
+    results = np.zeros(12)
+    envs = [16, 32, 64, 128]
+    caches = [1024, 2048, 4096]
+        
+    # coefficient matrix for linear regression to predict SPS based on num_envs and cache
+    A = np.zeros((len(envs) * len(caches), 3))
+    A = np.hstack((
+        np.repeat(envs, len(caches)).reshape(-1, 1),
+        np.tile(caches, len(envs)).reshape(-1, 1),
+        np.ones((len(envs) * len(caches), 1))
+    ))
+
+    for envs_idx, num_envs in enumerate(envs):
+        for cache_idx, cache in enumerate(caches):
+            env = Threes(num_envs=num_envs)
+            env.reset()
+            steps = 0
+
+            actions = np.random.randint(0, 4, (cache, num_envs))
+
+            i = 0
+            import time
+            start = time.time()
+            while time.time() - start < 0.3:
+                env.step(actions[i % cache])
+                steps += num_envs
+                i += 1
+
+            env.close()
+            sps = int(steps / (time.time() - start))
+            results[envs_idx * len(caches) + cache_idx] = sps
+
+    b = results.reshape(-1, 1)
+    # Ax = b
+    # use pytorch symeig to calculate eigenvectors / eigenvalues of A^T A for linear regression
+    A_t = torch.tensor(A, dtype=torch.float64)
+    AtA = A_t.T @ A_t
+    eigenvalues, eigenvectors = torch.symeig(AtA, eigenvectors=True)
+
 if __name__ == '__main__':
     N = 128
 
@@ -94,5 +136,8 @@ if __name__ == '__main__':
         i += 1
 
     print('Threes SPS:', int(steps / (time.time() - start)))
+
+    # 
+    # calculate eigenvectors of 
 
     env.close()
