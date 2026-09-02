@@ -142,6 +142,7 @@ MAKE_FUNCTIONS = {
     'terraform': 'Terraform',
     'template': 'Template',
     'tripletriad': 'TripleTriad',
+    'trading': 'Trading',
     'tactical': 'Tactical',
     'target': 'Target',
     'go': 'Go',
