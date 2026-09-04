@@ -18,6 +18,234 @@ Recurrent = pufferlib.models.LSTMWrapper
 from pufferlib.pytorch import layer_init, _nativize_dtype, nativize_tensor
 import numpy as np
 
+_trading_obs_stats = None
+def _load_trading_obs_stats():
+    '''Loads obs_stats.pkl (see ocean/trading/compute_obs_stats.py), cached
+    across both Trading policy classes.'''
+    global _trading_obs_stats
+    if _trading_obs_stats is None:
+        import os, pickle
+        from pufferlib.ocean.trading import trading as trading_mod
+        path = os.path.join(os.path.dirname(trading_mod.__file__), 'obs_stats.pkl')
+        with open(path, 'rb') as fp:
+            _trading_obs_stats = pickle.load(fp)
+    return _trading_obs_stats
+
+
+class TradingTransformer(nn.Module):
+    '''Trading policy variant: encodes each option slot (owned and market,
+    same shared weights) independently, then runs self-attention over the
+    market slots so every option's buy/skip decision can be informed by
+    every other option -- not just the ones before it in the array, as a
+    plain RNN would give. Globals go through a small separate linear layer.
+    Standalone (no outer LSTMWrapper): this env is already fully observable
+    each tick, and the per-slot representations needed for 32 independent
+    decisions don't fit through LSTMWrapper's fixed-width hidden state
+    cleanly.
+
+    Kept for reference / as a fallback -- measured far too slow on MPS
+    (attention's many small ops, especially in backward, incur heavy
+    per-kernel dispatch overhead there). See Trading below for the
+    shared-MLP-plus-pooling variant actually in use, which is ~15-50x
+    faster in practice with the same shared-weights-across-slots property,
+    at the cost of only approximate (mean-pooled, not pairwise) cross-slot
+    interaction. Set policy_name = TradingTransformer to switch back.
+    '''
+    def __init__(self, env, hidden_size=64, num_heads=4, num_layers=2):
+        super().__init__()
+        from pufferlib.ocean.trading.trading import (
+            MAX_OPTIONS, CURRENT_OPTION_FEATURES, GLOBAL_FEATURES)
+
+        self.is_multidiscrete = False
+        self.is_continuous = False
+        self.num_actions = env.single_action_space.n  # MAX_OPTIONS + 1 ("buy nothing")
+
+        self.max_options = MAX_OPTIONS
+        self.option_features = CURRENT_OPTION_FEATURES
+        self.num_globals = GLOBAL_FEATURES
+        self.hidden_size = hidden_size
+
+        # Empirically-measured (see compute_obs_stats.py) per-feature std
+        # under a random policy, used to normalize below -- replaces
+        # hand-picked constants with the env's actual observed scale.
+        stats = _load_trading_obs_stats()
+        self.register_buffer('owned_scale', torch.from_numpy(stats['owned_std']))
+        self.register_buffer('market_scale', torch.from_numpy(stats['market_std']))
+        self.register_buffer('global_scale', torch.from_numpy(stats['global_std']))
+
+        # Same weights for owned and market rows -- "encode this option's
+        # raw features" is the same task regardless of which block it's in.
+        self.option_encoder = nn.Sequential(
+            layer_init(nn.Linear(self.option_features, hidden_size)),
+            nn.GELU(),
+        )
+
+        self.global_encoder = nn.Sequential(
+            layer_init(nn.Linear(self.num_globals, hidden_size)),
+            nn.GELU(),
+        )
+
+        # All-to-all attention over the market slots -- no positional
+        # encoding, since slot order is arbitrary (generation order, not a
+        # meaningful sequence), so this stays permutation-equivariant.
+        attn_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size, nhead=num_heads,
+            dim_feedforward=4 * hidden_size, batch_first=True,
+        )
+        self.market_context = nn.TransformerEncoder(attn_layer, num_layers=num_layers)
+
+        # One logit per slot (shared weights across all 32) plus one extra
+        # logit for "buy nothing" -- together form a single Discrete(33), so
+        # there's exactly one action per tick, no cross-slot credit smearing.
+        self.decoder = layer_init(nn.Linear(2 * hidden_size, 1), std=0.01)
+        self.noop_head = layer_init(nn.Linear(hidden_size, 1), std=0.01)
+        self.value = layer_init(nn.Linear(hidden_size, 1), std=1)
+
+    def encode_observations(self, observations, state=None):
+        batch = observations.shape[0]
+        obs = observations.float().view(batch, -1)
+
+        n, f = self.max_options, self.option_features
+        owned = obs[:, :n*f].view(batch, n, f)
+        market = obs[:, n*f:2*n*f].view(batch, n, f)
+        global_obs = obs[:, 2*n*f:2*n*f + self.num_globals]
+
+        # Feature scaling, same approach as other ocean envs (e.g. dividing
+        # pixel features by 255): raw cash/tick/strike/price are wildly
+        # different orders of magnitude (cash ~10,000 vs. price ~0-20), which
+        # otherwise swamps the network before it ever learns anything.
+        owned = owned / self.owned_scale
+        market = market / self.market_scale
+        global_obs = global_obs / self.global_scale
+
+        owned_enc = self.option_encoder(owned)    # [batch, 32, H]
+        market_enc = self.option_encoder(market)  # [batch, 32, H] -- shared weights
+
+        market_ctx = self.market_context(market_enc)  # [batch, 32, H], all-to-all
+
+        global_ctx = self.global_encoder(global_obs)  # [batch, H]
+        owned_summary = owned_enc.mean(dim=1)          # [batch, H] pooled risk context
+        pooled = global_ctx + owned_summary             # [batch, H] -- feeds the value head
+
+        broadcast_ctx = pooled.unsqueeze(1).expand(-1, n, -1)   # [batch, 32, H]
+        per_slot = torch.cat([market_ctx, broadcast_ctx], dim=-1)  # [batch, 32, 2H]
+
+        return per_slot, pooled
+
+    def decode_actions(self, hidden):
+        per_slot, pooled = hidden
+        slot_logits = self.decoder(per_slot).squeeze(-1)   # [batch, 32]
+        noop_logit = self.noop_head(pooled)                # [batch, 1]
+        logits = torch.cat([slot_logits, noop_logit], dim=1)  # [batch, 33]
+        values = self.value(pooled)
+        return logits, values
+
+    def forward_eval(self, observations, state=None):
+        hidden = self.encode_observations(observations, state=state)
+        return self.decode_actions(hidden)
+
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
+
+
+class Trading(nn.Module):
+    '''Trading policy: encodes each option slot (owned and market, same
+    shared weights) independently, then pools (mean) into a single set
+    summary broadcast back onto every slot for its own buy/skip decision --
+    no attention, no recurrence. This still gives every slot the key fix
+    (a shared, once-learned "value this option" relationship instead of 32
+    independently-parameterized copies of it), just without explicit
+    pairwise cross-slot interaction, which TradingTransformer has but was
+    far too slow on MPS in practice (see that class's docstring). Standalone
+    (no outer LSTMWrapper) for the same reason as TradingTransformer.
+    '''
+    def __init__(self, env, hidden_size=128):
+        super().__init__()
+        from pufferlib.ocean.trading.trading import (
+            MAX_OPTIONS, CURRENT_OPTION_FEATURES, GLOBAL_FEATURES)
+
+        self.is_multidiscrete = False
+        self.is_continuous = False
+        self.num_actions = env.single_action_space.n  # MAX_OPTIONS + 1 ("buy nothing")
+
+        self.max_options = MAX_OPTIONS
+        self.option_features = CURRENT_OPTION_FEATURES
+        self.num_globals = GLOBAL_FEATURES
+        self.hidden_size = hidden_size
+
+        # Empirically-measured (see compute_obs_stats.py) per-feature std
+        # under a random policy, used to normalize below -- replaces
+        # hand-picked constants with the env's actual observed scale.
+        stats = _load_trading_obs_stats()
+        self.register_buffer('owned_scale', torch.from_numpy(stats['owned_std']))
+        self.register_buffer('market_scale', torch.from_numpy(stats['market_std']))
+        self.register_buffer('global_scale', torch.from_numpy(stats['global_std']))
+
+        # Same weights for owned and market rows -- "encode this option's
+        # raw features" is the same task regardless of which block it's in.
+        self.option_encoder = nn.Sequential(
+            layer_init(nn.Linear(self.option_features, hidden_size)),
+            nn.GELU(),
+        )
+
+        self.global_encoder = nn.Sequential(
+            layer_init(nn.Linear(self.num_globals, hidden_size)),
+            nn.GELU(),
+        )
+
+        # One logit per slot (shared weights across all 32) plus one extra
+        # logit for "buy nothing" -- together form a single Discrete(33), so
+        # there's exactly one action per tick, no cross-slot credit smearing.
+        self.decoder = layer_init(nn.Linear(2 * hidden_size, 1), std=0.01)
+        self.noop_head = layer_init(nn.Linear(hidden_size, 1), std=0.01)
+        self.value = layer_init(nn.Linear(hidden_size, 1), std=1)
+
+    def encode_observations(self, observations, state=None):
+        batch = observations.shape[0]
+        obs = observations.float().view(batch, -1)
+
+        n, f = self.max_options, self.option_features
+        owned = obs[:, :n*f].view(batch, n, f)
+        market = obs[:, n*f:2*n*f].view(batch, n, f)
+        global_obs = obs[:, 2*n*f:2*n*f + self.num_globals]
+
+        # Feature scaling, same approach as other ocean envs (e.g. dividing
+        # pixel features by 255): raw cash/tick/strike/price are wildly
+        # different orders of magnitude (cash ~10,000 vs. price ~0-20), which
+        # otherwise swamps the network before it ever learns anything.
+        owned = owned / self.owned_scale
+        market = market / self.market_scale
+        global_obs = global_obs / self.global_scale
+
+        owned_enc = self.option_encoder(owned)    # [batch, 32, H]
+        market_enc = self.option_encoder(market)  # [batch, 32, H] -- shared weights
+
+        global_ctx = self.global_encoder(global_obs)  # [batch, H]
+        # Cheap set summary: mean-pool instead of attention -- every slot's
+        # decision sees an average of the whole set, not each other slot
+        # directly, in exchange for orders-of-magnitude cheaper compute.
+        pooled = global_ctx + owned_enc.mean(dim=1) + market_enc.mean(dim=1)  # [batch, H]
+
+        broadcast_ctx = pooled.unsqueeze(1).expand(-1, n, -1)      # [batch, 32, H]
+        per_slot = torch.cat([market_enc, broadcast_ctx], dim=-1)  # [batch, 32, 2H]
+
+        return per_slot, pooled
+
+    def decode_actions(self, hidden):
+        per_slot, pooled = hidden
+        slot_logits = self.decoder(per_slot).squeeze(-1)   # [batch, 32]
+        noop_logit = self.noop_head(pooled)                # [batch, 1]
+        logits = torch.cat([slot_logits, noop_logit], dim=1)  # [batch, 33]
+        values = self.value(pooled)
+        return logits, values
+
+    def forward_eval(self, observations, state=None):
+        hidden = self.encode_observations(observations, state=state)
+        return self.decode_actions(hidden)
+
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
+
 
 class Boids(nn.Module):
     def __init__(self, env, cnn_channels=32, hidden_size=128, **kwargs):

@@ -2,10 +2,14 @@
 #define Env Trading
 #include "../env_binding.h"
 
-// Trading has no required init-time kwargs: MAX_OPTIONS/OPTION_FEATURES/etc.
-// are compile-time constants, and per-episode state (underlying, heap, cash)
-// is set up by c_reset (called separately via vec_reset), not here.
+// MAX_OPTIONS/OPTION_FEATURES/etc. are compile-time constants, and
+// per-episode state (underlying, heap, cash) is set up by c_reset (called
+// separately via vec_reset), not here -- these are the real
+// runtime-configurable parameters.
 static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
+    env->min_daily_spend = unpack(kwargs, "min_daily_spend");
+    env->market_noise_lower = unpack(kwargs, "market_noise_lower");
+    env->market_noise_upper = unpack(kwargs, "market_noise_upper");
     return 0;
 }
 

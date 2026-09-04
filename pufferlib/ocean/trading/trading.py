@@ -11,10 +11,14 @@ from pufferlib.ocean.trading import binding
 # tick varies, we pick a fixed upper bound (MAX_OPTIONS) and pad/mask unused slots.
 MAX_OPTIONS = 32
 
-# current_options slot: [time_to_expiry, strike_price, price, type, mask]
-CURRENT_OPTION_FEATURES = 5
-# buyable_options slot: [time_to_expiry, strike_price, price, type, mask]
-BUYABLE_OPTION_FEATURES = 5
+# current_options slot: [time_to_expiry, strike_price, price, theoretical_price, type, mask]
+# theoretical_price (the pre-noise Black-Scholes fair value) is a DEBUG
+# feature -- see Option in utils.h -- handed directly to the model so buying
+# "when price < theoretical_price" doesn't require learning Black-Scholes
+# implicitly first.
+CURRENT_OPTION_FEATURES = 6
+# buyable_options slot: [time_to_expiry, strike_price, price, theoretical_price, type, mask]
+BUYABLE_OPTION_FEATURES = 6
 
 # at the moment, current funds, underlying price, underlying volatility, 
 GLOBAL_FEATURES = 5 
@@ -23,7 +27,8 @@ OBS_SIZE = MAX_OPTIONS * CURRENT_OPTION_FEATURES + MAX_OPTIONS * BUYABLE_OPTION_
 
 
 class Trading(pufferlib.PufferEnv):
-    def __init__(self, num_envs=1, render_mode='human', buf=None, seed=0):
+    def __init__(self, num_envs=1, render_mode='human', buf=None, seed=0, min_daily_spend=0,
+            market_noise_lower=-0.02, market_noise_upper=0.1):
         self.num_agents = num_envs
         self.render_mode = render_mode
 
@@ -35,10 +40,12 @@ class Trading(pufferlib.PufferEnv):
             low=-np.inf, high=np.inf, shape=(OBS_SIZE,), dtype=np.float32
         )
 
-        # One buy/skip decision per buyable_options slot, aligned by index with
-        # the buyable_options block of the observation. Actions on masked
-        # (padding) slots are ignored on the C side.
-        self.single_action_space = gymnasium.spaces.MultiDiscrete([2] * MAX_OPTIONS)
+        # A single choice per tick: buy market slot i (0..MAX_OPTIONS-1), or
+        # MAX_OPTIONS itself meaning "buy nothing". Exactly one action, so
+        # exactly one purchase (or none) happens per tick by construction --
+        # no other slot's unused "would have bought" intent shares credit
+        # with whatever this choice's outcome turns out to be.
+        self.single_action_space = gymnasium.spaces.Discrete(MAX_OPTIONS + 1)
 
         super().__init__(buf)
 
@@ -51,6 +58,9 @@ class Trading(pufferlib.PufferEnv):
             num_envs,
             seed,
             max_options=MAX_OPTIONS,
+            min_daily_spend=min_daily_spend,
+            market_noise_lower=market_noise_lower,
+            market_noise_upper=market_noise_upper,
         )
 
     def reset(self, seed=None):
@@ -87,7 +97,7 @@ def test_performance(timeout=10, atn_cache=8192):
     env.reset()
     tick = 0
 
-    actions = np.random.randint(0, 2, (atn_cache, num_envs, MAX_OPTIONS)).astype(np.int32)
+    actions = np.random.randint(0, MAX_OPTIONS + 1, (atn_cache, num_envs)).astype(np.int32)
 
     import time
     start = time.time()

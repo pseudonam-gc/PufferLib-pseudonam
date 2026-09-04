@@ -6,7 +6,7 @@
 #include <math.h>
 
 // Width of one option's encoding in env->observations (see load_options/store_options below).
-const int OPTION_FEATURES = 5;
+const int OPTION_FEATURES = 6;
 
 // One tick = one trading day. Shared by anything converting between years
 // (time_to_expiry, GBM dt) and ticks (ticks, expiry_tick).
@@ -53,7 +53,12 @@ typedef enum {
 typedef struct {
     float time_to_expiry; // years until expiry, as generated/observed
     float strike_price;
-    float price;
+    float price; // what it actually costs (fair value with noise applied)
+    float theoretical_price; // DEBUG: fair value before noise, i.e. black_scholes(...)
+        // directly, given to the model so it doesn't have to learn that
+        // relationship implicitly -- if it still can't learn "buy when
+        // price < theoretical_price", the bug isn't about function
+        // approximation difficulty.
     OptionType type;
     bool mask; // false = padding slot, not a real option
     int expiry_tick;
@@ -61,7 +66,7 @@ typedef struct {
 
 // env->observations is a flat float32 buffer, so Option can't be aliased onto
 // it directly (type/mask aren't float-shaped) -- this converts explicitly.
-// slot layout: [time_to_expiry, strike_price, price, type, mask]
+// slot layout: [time_to_expiry, strike_price, price, theoretical_price, type, mask]
 // expiry_tick is never written here -- it's set once, at generation time
 // (see gen_test_options), and isn't part of the observation wire format.
 void store_options(float* observations, const Option* options, int count) {
@@ -70,8 +75,9 @@ void store_options(float* observations, const Option* options, int count) {
         slot[0] = options[i].time_to_expiry;
         slot[1] = options[i].strike_price;
         slot[2] = options[i].price;
-        slot[3] = (float)options[i].type;
-        slot[4] = options[i].mask ? 1.0f : 0.0f;
+        slot[3] = options[i].theoretical_price;
+        slot[4] = (float)options[i].type;
+        slot[5] = options[i].mask ? 1.0f : 0.0f;
     }
 }
 

@@ -23,13 +23,6 @@ const int INIT_FUNDS = 10000;
 // grow past MAX_OPTIONS over an episode. This just caps that heap's size.
 const int OWNED_CAPACITY = 8192;
 
-// Random noise added to generated option prices (market friction, not part
-// of the underlying's own price process -- see Underlying in utils.h).
-
-// MARKET_NOISE_UPPER makes the option more expensive, and vice versa
-const float MARKET_NOISE_UPPER = 0.1f;
-const float MARKET_NOISE_LOWER = 0.0f; 
-
 // Required struct. Only use floats!
 typedef struct {
     float perf;
@@ -50,6 +43,12 @@ typedef struct {
     Underlying underlying;
     float episode_reward; // sum of every tick's reward this episode, reset in c_reset
     Option pending_market[MAX_OPTIONS]; // today's closing quotes, bought against at the start of the next c_step
+    float min_daily_spend; // forced-investment param: reward -= max(0, this - spent_today)
+    // Random noise added to generated option prices (market friction, not
+    // part of the underlying's own price process -- see Underlying in
+    // utils.h). Upper makes an option more expensive, lower makes it cheaper.
+    float market_noise_lower;
+    float market_noise_upper;
 } Trading;
 
 void add_log(Trading* env) {
@@ -64,10 +63,14 @@ void allocate_all(Trading* env) {
     int option_info_features = MAX_OPTIONS * OPTION_FEATURES * 2;
     int memsize = (option_info_features + GLOBAL_FEATURES) * sizeof(float);
     env->observations = (float*)calloc(memsize, 1);
-    env->actions = (int*)calloc(MAX_OPTIONS, sizeof(int));
+    env->actions = (int*)calloc(1, sizeof(int)); // single Discrete(MAX_OPTIONS+1) choice
     env->rewards = (float*)calloc(1, sizeof(float));
     env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
     env->owned.data = NULL; // allocated on first reset
+    // Demo defaults; the Python side sets these via my_init/kwargs.
+    env->min_daily_spend = 10.0f;
+    env->market_noise_lower = -0.06f;
+    env->market_noise_upper = 0.1f;
 }
 
 void free_all(Trading* env) {
@@ -114,62 +117,86 @@ float black_scholes(
     return S * normal_cdf(d1) - K * exp(-r * T) * normal_cdf(d2);
 }
 
-Option* gen_test_options(Underlying* underlying, int tick) {
+Option* gen_test_options(Underlying* underlying, int tick, float noise_lower, float noise_upper) {
     static Option options[MAX_OPTIONS];
     for (int i = 0; i < MAX_OPTIONS; i++) {
         int ticks = 1 + (rand() % 100);
         options[i].time_to_expiry = ticks / TICKS_PER_YEAR;
         options[i].expiry_tick = tick + ticks; // set once, here, at true generation time
         options[i].strike_price = underlying->price * (0.8f + 0.4f * ((float)rand() / RAND_MAX));
-        options[i].price = black_scholes(underlying->price, options[i].strike_price,
-            options[i].time_to_expiry, underlying->drift, underlying->volatility);
+        // fmaxf guards deep-OTM float cancellation in black_scholes (true
+        // value ~0, but subtracting two tiny near-equal terms can round
+        // a hair below zero) -- true option prices can't be negative.
+        options[i].theoretical_price = fmaxf(0.0f, black_scholes(underlying->price, options[i].strike_price,
+            options[i].time_to_expiry, underlying->drift, underlying->volatility));
         options[i].type = CALL; // TODO: generate puts too
         options[i].mask = 1.0f;
 
-        // pick from (MARKET_NOISE_LOWER, MARKET_NOISE_UPPER) uniformly
-        float noise = MARKET_NOISE_LOWER + ((float)rand() / RAND_MAX) * (MARKET_NOISE_UPPER - MARKET_NOISE_LOWER);
-        options[i].price = options[i].price * (1.0f + noise);
+        // pick from (noise_lower, noise_upper) uniformly
+        float noise = noise_lower + ((float)rand() / RAND_MAX) * (noise_upper - noise_lower);
+        options[i].price = fmaxf(0.0f, options[i].theoretical_price * (1.0f + noise));
+        options[i].theoretical_price -= options[i].price;
     }
     return options;
 }
 
 // Required function
 void c_step(Trading* env) {
+    env->terminals[0] = 0;
     int option_info_size = 2*MAX_OPTIONS*OPTION_FEATURES;
     float cash = env->observations[option_info_size + 0];
 
-    // Trade against yesterday's closing quotes, at yesterday's closing price
-    // -- tick/underlying haven't advanced yet, so what's being bought is
-    // exactly what was priced, with no gap for it to have gone stale in.
-    int* actions = env->actions;
-    for (int i = 0; i < MAX_OPTIONS; i++) {
-        bool buyable = env->pending_market[i].mask && env->pending_market[i].expiry_tick <= MAX_TICKS;
-        if (actions[i] == 1 && buyable) {
-            cash -= env->pending_market[i].price;
-            heap_push(&env->owned, env->pending_market[i]);
+    // A single Discrete(MAX_OPTIONS+1) choice: index MAX_OPTIONS means "buy
+    // nothing"; this is the only action, so there's exactly one purchase (or
+    // none) per tick by construction -- no cross-slot credit-assignment
+    // confounding from other slots' unused "would have bought" intents.
+    //
+    // Instant resolution: theoretical_price already stores the edge (fair
+    // value - price), so paying it out now as both reward and cash change is
+    // equivalent to buying at `price` and immediately settling at fair
+    // value -- no heap, no waiting for expiry.
+    int choice = env->actions[0];
+    float spent_today = 0.0f;
+    float total_reward = 0.0f;
+    if (choice >= 0 && choice < MAX_OPTIONS) {
+        bool buyable = env->pending_market[choice].mask && env->pending_market[choice].expiry_tick <= MAX_TICKS;
+        if (buyable) {
+            float edge = env->pending_market[choice].theoretical_price;
+            cash += edge;
+            total_reward += edge;
+            spent_today += env->pending_market[choice].price;
         }
     }
 
-    // Settle anything expiring today, same (not-yet-advanced) closing price.
-    float total_reward = 0.0f;
-    while (env->owned.count > 0 && env->owned.data[0].expiry_tick <= env->tick) {
-        Option expired = heap_pop_min(&env->owned);
-        float payoff = (expired.type == CALL)
-            ? fmaxf(0.0f, env->underlying.price - expired.strike_price)
-            : fmaxf(0.0f, expired.strike_price - env->underlying.price);
-        cash += payoff;
-        total_reward += payoff - expired.price;
-    }
+    total_reward -= fmaxf(0.0f, env->min_daily_spend - spent_today);
+
+    env->rewards[0] = total_reward;
+    env->episode_reward += total_reward;
 
     // A new day begins.
     env->tick += 1;
     env->underlying.price = gbm_step(env->underlying.price,
         env->underlying.drift, env->underlying.volatility, 1.0f/TICKS_PER_YEAR);
 
+    if (env->tick >= MAX_TICKS) {
+        env->terminals[0] = 1;
+        add_log(env);
+        c_reset(env);
+        // c_reset reinitializes cash (in env->observations) and tick -- re-read
+        // both so what we write back below reflects the new episode, not stale
+        // pre-reset locals (this is what was clobbering the terminal-tick
+        // market/mask before: generation used to run before this check, so
+        // c_reset's memset wiped the just-written market back to zero).
+        cash = env->observations[option_info_size + 0];
+    }
+
     // Today's quotes: expiry_tick is set here, at true generation time, so it
     // always matches the tick/price this batch was actually priced under.
-    memcpy(env->pending_market, gen_test_options(&env->underlying, env->tick),
-        MAX_OPTIONS * sizeof(Option));
+    // Runs after any reset above, so a terminal tick's returned observation
+    // is always a valid, fully-populated market (the new episode's real
+    // first observation), never a zeroed-out leftover.
+    memcpy(env->pending_market, gen_test_options(&env->underlying, env->tick,
+        env->market_noise_lower, env->market_noise_upper), MAX_OPTIONS * sizeof(Option));
     store_options(env->observations + MAX_OPTIONS*OPTION_FEATURES, env->pending_market, MAX_OPTIONS);
 
     Option top_k[MAX_OPTIONS] = {0};
@@ -179,14 +206,6 @@ void c_step(Trading* env) {
     env->observations[option_info_size + 0] = cash;
     env->observations[option_info_size + 2] = (float)env->tick;
     env->observations[option_info_size + 4] = (float)env->owned.count;
-    env->rewards[0] = total_reward;
-    env->episode_reward += total_reward;
-
-    if (env->tick >= MAX_TICKS) {
-        env->terminals[0] = 1;
-        add_log(env);
-        c_reset(env);
-    }
 }
 
 // Required function. Should handle creating the client on first call

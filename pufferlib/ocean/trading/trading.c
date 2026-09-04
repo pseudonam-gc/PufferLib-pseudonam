@@ -17,10 +17,10 @@ float demo() {
     c_reset(&env);
 
     for (int step = 0; step < DEMO_STEPS; step++) {
-        // c_step already ignores actions on masked (invalid) market slots.
-        for (int i = 0; i < MAX_OPTIONS; i++) {
-            env.actions[i] = ((float)rand() / RAND_MAX) < BUY_PROBABILITY;
-        }
+        // A single Discrete(MAX_OPTIONS+1) choice; c_step ignores it if that
+        // slot isn't actually buyable. MAX_OPTIONS itself means "buy nothing".
+        env.actions[0] = ((float)rand() / RAND_MAX) < BUY_PROBABILITY
+            ? rand() % MAX_OPTIONS : MAX_OPTIONS;
 
         c_step(&env);
 
