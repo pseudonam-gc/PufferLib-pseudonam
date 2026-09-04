@@ -41,12 +41,10 @@ typedef struct {
     int tick;
     OwnedOptionHeap owned; // currently-held contracts, sorted by expiry
     Underlying underlying;
-    float episode_reward; // sum of every tick's reward this episode, reset in c_reset
+    float episode_reward; // sum of every tick's reward this episode: reset in c_reset
     Option pending_market[MAX_OPTIONS]; // today's closing quotes, bought against at the start of the next c_step
     float min_daily_spend; // forced-investment param: reward -= max(0, this - spent_today)
-    // Random noise added to generated option prices (market friction, not
-    // part of the underlying's own price process -- see Underlying in
-    // utils.h). Upper makes an option more expensive, lower makes it cheaper.
+    // random noise added to the price of the option, the range being [market_noise_lower, market_noise_upper
     float market_noise_lower;
     float market_noise_upper;
 } Trading;
@@ -92,7 +90,6 @@ void c_reset(Trading* env) {
     init_underlying(&env->underlying);
     memset(env->pending_market, 0, sizeof(env->pending_market));
 
-    // Allocate the heap once; later resets just clear the count.
     if (env->owned.data == NULL) {
         env->owned.data = (Option*)calloc(OWNED_CAPACITY, sizeof(Option));
         env->owned.capacity = OWNED_CAPACITY;
@@ -124,15 +121,11 @@ Option* gen_test_options(Underlying* underlying, int tick, float noise_lower, fl
         options[i].time_to_expiry = ticks / TICKS_PER_YEAR;
         options[i].expiry_tick = tick + ticks; // set once, here, at true generation time
         options[i].strike_price = underlying->price * (0.8f + 0.4f * ((float)rand() / RAND_MAX));
-        // fmaxf guards deep-OTM float cancellation in black_scholes (true
-        // value ~0, but subtracting two tiny near-equal terms can round
-        // a hair below zero) -- true option prices can't be negative.
         options[i].theoretical_price = fmaxf(0.0f, black_scholes(underlying->price, options[i].strike_price,
             options[i].time_to_expiry, underlying->drift, underlying->volatility));
         options[i].type = CALL; // TODO: generate puts too
         options[i].mask = 1.0f;
 
-        // pick from (noise_lower, noise_upper) uniformly
         float noise = noise_lower + ((float)rand() / RAND_MAX) * (noise_upper - noise_lower);
         options[i].price = fmaxf(0.0f, options[i].theoretical_price * (1.0f + noise));
         options[i].theoretical_price -= options[i].price;
@@ -146,15 +139,7 @@ void c_step(Trading* env) {
     int option_info_size = 2*MAX_OPTIONS*OPTION_FEATURES;
     float cash = env->observations[option_info_size + 0];
 
-    // A single Discrete(MAX_OPTIONS+1) choice: index MAX_OPTIONS means "buy
-    // nothing"; this is the only action, so there's exactly one purchase (or
-    // none) per tick by construction -- no cross-slot credit-assignment
-    // confounding from other slots' unused "would have bought" intents.
-    //
-    // Instant resolution: theoretical_price already stores the edge (fair
-    // value - price), so paying it out now as both reward and cash change is
-    // equivalent to buying at `price` and immediately settling at fair
-    // value -- no heap, no waiting for expiry.
+    // one option purchase per env step, but time doesn't advance until no-op is selected.
     int choice = env->actions[0];
     float spent_today = 0.0f;
     float total_reward = 0.0f;
@@ -163,17 +148,18 @@ void c_step(Trading* env) {
         if (buyable) {
             float edge = env->pending_market[choice].theoretical_price;
             cash += edge;
+            // theoretical_price is currently hardcoded into the model and gives reward instantly, instead of at expiry.
+            // this is just for testing and is obviously unrealistic. delayed rewards problem go brr.
             total_reward += edge;
             spent_today += env->pending_market[choice].price;
         }
     }
-
+    
     total_reward -= fmaxf(0.0f, env->min_daily_spend - spent_today);
 
     env->rewards[0] = total_reward;
     env->episode_reward += total_reward;
 
-    // A new day begins.
     env->tick += 1;
     env->underlying.price = gbm_step(env->underlying.price,
         env->underlying.drift, env->underlying.volatility, 1.0f/TICKS_PER_YEAR);
@@ -182,19 +168,10 @@ void c_step(Trading* env) {
         env->terminals[0] = 1;
         add_log(env);
         c_reset(env);
-        // c_reset reinitializes cash (in env->observations) and tick -- re-read
-        // both so what we write back below reflects the new episode, not stale
-        // pre-reset locals (this is what was clobbering the terminal-tick
-        // market/mask before: generation used to run before this check, so
-        // c_reset's memset wiped the just-written market back to zero).
         cash = env->observations[option_info_size + 0];
     }
 
-    // Today's quotes: expiry_tick is set here, at true generation time, so it
-    // always matches the tick/price this batch was actually priced under.
-    // Runs after any reset above, so a terminal tick's returned observation
-    // is always a valid, fully-populated market (the new episode's real
-    // first observation), never a zeroed-out leftover.
+    // Observations are loaded after reset() to prepare for the next playout.
     memcpy(env->pending_market, gen_test_options(&env->underlying, env->tick,
         env->market_noise_lower, env->market_noise_upper), MAX_OPTIONS * sizeof(Option));
     store_options(env->observations + MAX_OPTIONS*OPTION_FEATURES, env->pending_market, MAX_OPTIONS);
