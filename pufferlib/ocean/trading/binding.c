@@ -7,7 +7,7 @@
 // separately via vec_reset), not here -- these are the real
 // runtime-configurable parameters.
 static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
-    env->min_daily_spend = unpack(kwargs, "min_daily_spend");
+    env->min_tick_spend = unpack(kwargs, "min_tick_spend");
     env->market_noise_lower = unpack(kwargs, "market_noise_lower");
     env->market_noise_upper = unpack(kwargs, "market_noise_upper");
     return 0;

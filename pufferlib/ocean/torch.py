@@ -177,8 +177,11 @@ class Trading(nn.Module):
         # under a random policy, used to normalize below -- replaces
         # hand-picked constants with the env's actual observed scale.
         stats = _load_trading_obs_stats()
+        self.register_buffer('owned_mean', torch.from_numpy(stats['owned_mean']))
         self.register_buffer('owned_scale', torch.from_numpy(stats['owned_std']))
+        self.register_buffer('market_mean', torch.from_numpy(stats['market_mean']))
         self.register_buffer('market_scale', torch.from_numpy(stats['market_std']))
+        self.register_buffer('global_mean', torch.from_numpy(stats['global_mean']))
         self.register_buffer('global_scale', torch.from_numpy(stats['global_std']))
 
         # Same weights for owned and market rows -- "encode this option's
@@ -213,6 +216,10 @@ class Trading(nn.Module):
         # pixel features by 255): raw cash/tick/strike/price are wildly
         # different orders of magnitude (cash ~10,000 vs. price ~0-20), which
         # otherwise swamps the network before it ever learns anything.
+        
+        #owned = (owned - self.owned_mean) / self.owned_scale
+        #market = (market - self.market_mean) / self.market_scale
+        #global_obs = (global_obs - self.global_mean) / self.global_scale
         owned = owned / self.owned_scale
         market = market / self.market_scale
         global_obs = global_obs / self.global_scale

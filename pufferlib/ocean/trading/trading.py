@@ -2,8 +2,7 @@ import numpy as np
 import gymnasium
 import pufferlib
 from pufferlib.ocean.trading import binding
-
-# TODO: calculate relative to underlying values
+from pufferlib.ocean.torch import _load_trading_obs_stats
 
 # PufferEnv requires a flat Box observation_space and a Discrete/MultiDiscrete/Box
 # action_space (see pufferlib.PufferEnv.__init__) -- Sequence/Dict spaces are not
@@ -27,7 +26,7 @@ OBS_SIZE = MAX_OPTIONS * CURRENT_OPTION_FEATURES + MAX_OPTIONS * BUYABLE_OPTION_
 
 
 class Trading(pufferlib.PufferEnv):
-    def __init__(self, num_envs=1, render_mode='human', buf=None, seed=0, min_daily_spend=0,
+    def __init__(self, num_envs=1, render_mode='human', buf=None, seed=0, min_tick_spend=0,
             market_noise_lower=-0.02, market_noise_upper=0.1):
         self.num_agents = num_envs
         self.render_mode = render_mode
@@ -49,6 +48,8 @@ class Trading(pufferlib.PufferEnv):
 
         super().__init__(buf)
 
+        self.stats = _load_trading_obs_stats()
+
         self.c_envs = binding.vec_init(
             self.observations,
             self.actions,
@@ -58,7 +59,7 @@ class Trading(pufferlib.PufferEnv):
             num_envs,
             seed,
             max_options=MAX_OPTIONS,
-            min_daily_spend=min_daily_spend,
+            min_tick_spend=min_tick_spend,
             market_noise_lower=market_noise_lower,
             market_noise_upper=market_noise_upper,
         )
@@ -78,7 +79,7 @@ class Trading(pufferlib.PufferEnv):
 
         return (
             self.observations,
-            self.rewards,
+            self.rewards / self.stats['reward_std'],  # normalize reward to ~1.0 std
             self.terminals,
             self.truncations,
             info

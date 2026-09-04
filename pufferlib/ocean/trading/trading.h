@@ -38,12 +38,14 @@ typedef struct {
     int* actions;
     float* rewards;
     unsigned char* terminals;
-    int tick;
+    int tick; // number of time steps 
+    int step; // number of env steps (can be multiple per tick)
     OwnedOptionHeap owned; // currently-held contracts, sorted by expiry
     Underlying underlying;
     float episode_reward; // sum of every tick's reward this episode: reset in c_reset
-    Option pending_market[MAX_OPTIONS]; // today's closing quotes, bought against at the start of the next c_step
-    float min_daily_spend; // forced-investment param: reward -= max(0, this - spent_today)
+    Option pending_market[MAX_OPTIONS]; // tick's closing quotes, bought against at the start of the next c_step
+    float tick_spend; // how much was spent on options this tick, for min_tick_spend reward
+    float min_tick_spend; // forced-investment param: reward -= max(0, this - tick_spend)
     // random noise added to the price of the option, the range being [market_noise_lower, market_noise_upper
     float market_noise_lower;
     float market_noise_upper;
@@ -66,7 +68,8 @@ void allocate_all(Trading* env) {
     env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
     env->owned.data = NULL; // allocated on first reset
     // Demo defaults; the Python side sets these via my_init/kwargs.
-    env->min_daily_spend = 10.0f;
+    env->tick_spend = 0.0f;
+    env->min_tick_spend = 10.0f;
     env->market_noise_lower = -0.06f;
     env->market_noise_upper = 0.1f;
 }
@@ -86,6 +89,8 @@ void c_reset(Trading* env) {
     memset(env->observations, 0, memsize);
     env->observations[option_info_features + 0] = INIT_FUNDS;
     env->tick = 0;
+    env->step = 0;
+    env->tick_spend = 0.0f;
     env->episode_reward = 0.0f;
     init_underlying(&env->underlying);
     memset(env->pending_market, 0, sizeof(env->pending_market));
@@ -128,7 +133,7 @@ Option* gen_test_options(Underlying* underlying, int tick, float noise_lower, fl
 
         float noise = noise_lower + ((float)rand() / RAND_MAX) * (noise_upper - noise_lower);
         options[i].price = fmaxf(0.0f, options[i].theoretical_price * (1.0f + noise));
-        options[i].theoretical_price -= options[i].price;
+        options[i].theoretical_price -= options[i].price; // DEBUG: store the edge in the theoretical_price field for reward shaping
     }
     return options;
 }
@@ -141,39 +146,65 @@ void c_step(Trading* env) {
 
     // one option purchase per env step, but time doesn't advance until no-op is selected.
     int choice = env->actions[0];
-    float spent_today = 0.0f;
     float total_reward = 0.0f;
     if (choice >= 0 && choice < MAX_OPTIONS) {
         bool buyable = env->pending_market[choice].mask && env->pending_market[choice].expiry_tick <= MAX_TICKS;
         if (buyable) {
-            float edge = env->pending_market[choice].theoretical_price;
+            float edge = env->pending_market[choice].theoretical_price; 
             cash += edge;
             // theoretical_price is currently hardcoded into the model and gives reward instantly, instead of at expiry.
             // this is just for testing and is obviously unrealistic. delayed rewards problem go brr.
             total_reward += edge;
-            spent_today += env->pending_market[choice].price;
+            env->tick_spend += env->pending_market[choice].price;
+            env->pending_market[choice].mask = 0; // no longer buyable
+            // zero everything
+            env->pending_market[choice].time_to_expiry = 0.0f;
+            env->pending_market[choice].strike_price = 0.0f;
+            env->pending_market[choice].price = 0.0f;
+            env->pending_market[choice].theoretical_price = 0.0f;
+            env->pending_market[choice].type = CALL;
+            env->pending_market[choice].expiry_tick = 0;
+        } else {
+            /*if (!env->pending_market[choice].mask) {
+                total_reward -= 2.0f;
+            }*/
+            // end the trading tick early, decrease reward by 5 to penalize 
+            choice = MAX_OPTIONS;
         }
     }
-    
-    total_reward -= fmaxf(0.0f, env->min_daily_spend - spent_today);
 
-    env->rewards[0] = total_reward;
-    env->episode_reward += total_reward;
+    //bool advance_market = (choice == MAX_OPTIONS);
+    bool advance_market = true;
 
-    env->tick += 1;
-    env->underlying.price = gbm_step(env->underlying.price,
-        env->underlying.drift, env->underlying.volatility, 1.0f/TICKS_PER_YEAR);
+    // advance tick if choice is the final no-op action, moving to the next time interval
+    if (advance_market) {
+        total_reward -= fmaxf(0.0f, env->min_tick_spend - env->tick_spend);
+        env->tick += 1;
 
-    if (env->tick >= MAX_TICKS) {
-        env->terminals[0] = 1;
-        add_log(env);
-        c_reset(env);
-        cash = env->observations[option_info_size + 0];
+        env->underlying.price = gbm_step(env->underlying.price,
+            env->underlying.drift, env->underlying.volatility, 1.0f/TICKS_PER_YEAR);
+
+        env->rewards[0] = total_reward;
+        env->episode_reward += total_reward;
+
+        if (env->tick >= MAX_TICKS) {
+            env->terminals[0] = 1;
+            add_log(env);
+            c_reset(env);
+            cash = env->observations[option_info_size + 0];
+        }
+
+        // amount spent on tick is reset
+        env->tick_spend = 0.0f;
+        
+        // generate the next market 
+        memcpy(env->pending_market, gen_test_options(&env->underlying, env->tick,
+            env->market_noise_lower, env->market_noise_upper), MAX_OPTIONS * sizeof(Option));
+            
     }
 
-    // Observations are loaded after reset() to prepare for the next playout.
-    memcpy(env->pending_market, gen_test_options(&env->underlying, env->tick,
-        env->market_noise_lower, env->market_noise_upper), MAX_OPTIONS * sizeof(Option));
+    env->step += 1;
+
     store_options(env->observations + MAX_OPTIONS*OPTION_FEATURES, env->pending_market, MAX_OPTIONS);
 
     Option top_k[MAX_OPTIONS] = {0};
